@@ -41,7 +41,7 @@ impl Output {
                 serde_json::to_string_pretty(&value).unwrap_or_default()
             );
         } else {
-            print!("{}", text(&value));
+            print!("{}", sanitize(&text(&value)));
         }
     }
 
@@ -53,9 +53,17 @@ impl Output {
                 serde_json::to_string_pretty(&body).unwrap_or_default()
             );
         } else {
-            eprintln!("error: {}", err.message);
+            eprintln!("error: {}", sanitize(&err.message));
         }
     }
+}
+
+/// Drops control characters (ANSI escapes, OSC sequences) from Slack-sourced text
+/// before it reaches a terminal; JSON output is already escaped by serde.
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
 }
 
 fn pick(item: &Value, fields: &[String]) -> Value {
@@ -101,6 +109,11 @@ mod tests {
             p,
             json!({"channel":"C1","messages":[{"ts":"1","user.id":"U1"}]})
         );
+    }
+
+    #[test]
+    fn strips_terminal_escapes() {
+        assert_eq!(sanitize("a\x1b]52;c;x\x07b\n\u{9b}c"), "a]52;c;xb\nc");
     }
 
     #[test]

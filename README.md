@@ -14,9 +14,9 @@ The installer checks the binary against the release's `SHA256SUMS`. To build fro
 ## Auth
 
 ```sh
-slk auth login --token xoxp-...              # user token (search works) or xoxb- bot token
+SLK_LOGIN_TOKEN=xoxp-... slk auth login      # user token (search works) or xoxb- bot token
 slk auth parse-curl --login < request.curl   # browser session: DevTools → Network → any /api/ call → Copy as cURL
-slk auth login-browser --xoxc ... --xoxd ... --workspace-url https://acme.slack.com
+SLK_XOXC=... SLK_XOXD=... slk auth login-browser --workspace-url https://acme.slack.com
 SLK_TOKEN=xoxp-... slk conversations list    # ephemeral, nothing stored
 ```
 

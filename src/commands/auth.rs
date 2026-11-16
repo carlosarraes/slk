@@ -11,6 +11,7 @@ use std::io::Read;
 pub enum AuthCmd {
     /// Store a bot (xoxb) or user (xoxp) token
     Login {
+        /// Prefer SLK_LOGIN_TOKEN: argv is visible in `ps` and shell history
         #[arg(long, env = "SLK_LOGIN_TOKEN", hide_env_values = true)]
         token: String,
         /// Profile name to store under (default: team name)
@@ -19,9 +20,10 @@ pub enum AuthCmd {
     },
     /// Store a browser session (xoxc token + d cookie)
     LoginBrowser {
-        #[arg(long, hide_env_values = true)]
+        /// Prefer the env var: argv is visible in `ps` and shell history
+        #[arg(long, env = "SLK_XOXC", hide_env_values = true)]
         xoxc: String,
-        #[arg(long, hide_env_values = true)]
+        #[arg(long, env = "SLK_XOXD", hide_env_values = true)]
         xoxd: String,
         #[arg(long)]
         workspace_url: String,
@@ -31,8 +33,9 @@ pub enum AuthCmd {
         #[arg(long)]
         profile: Option<String>,
     },
-    /// Parse a DevTools "Copy as cURL" of a Slack /api/ request (arg or stdin)
+    /// Parse a DevTools "Copy as cURL" of a Slack /api/ request (stdin recommended)
     ParseCurl {
+        /// The cURL text; omit to read stdin (keeps secrets out of argv)
         curl: Option<String>,
         /// Store the parsed session as a workspace
         #[arg(long)]
