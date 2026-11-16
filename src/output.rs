@@ -11,6 +11,8 @@ const LIST_KEYS: &[&str] = &[
     "matches",
     "threads",
     "workspaces",
+    "files",
+    "rows",
 ];
 
 pub struct Output {
@@ -20,7 +22,8 @@ pub struct Output {
 
 impl Output {
     pub fn new(json: bool, text: bool, fields: Option<String>) -> Self {
-        let json = json || (!text && !std::io::stdout().is_terminal());
+        // --fields trims JSON, so it implies JSON unless --text is explicit.
+        let json = json || (!text && (fields.is_some() || !std::io::stdout().is_terminal()));
         let fields = fields.map(|f| {
             f.split(',')
                 .map(|s| s.trim().to_string())
@@ -79,6 +82,13 @@ fn pick(item: &Value, fields: &[String]) -> Value {
 fn project(value: Value, fields: &[String]) -> Value {
     match value {
         Value::Array(items) => Value::Array(items.iter().map(|i| pick(i, fields)).collect()),
+        Value::Object(map)
+            if fields
+                .iter()
+                .all(|f| map.contains_key(f.split('.').next().unwrap_or_default())) =>
+        {
+            pick(&Value::Object(map), fields)
+        }
         Value::Object(mut map) => {
             match LIST_KEYS
                 .iter()

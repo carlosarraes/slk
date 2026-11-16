@@ -8,6 +8,7 @@ mod output;
 mod permalink;
 mod render;
 mod resolve;
+mod time;
 
 fn main() {
     std::process::exit(cli::run());

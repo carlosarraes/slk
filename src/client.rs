@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 /// network, so no code path can post, edit, react or mark-read.
 pub const READ_METHODS: &[&str] = &[
     "auth.test",
+    "files.info",
+    "files.list",
+    "slackLists.items.list",
+    "usergroups.list",
     "client.counts",
     "conversations.history",
     "conversations.info",
@@ -133,6 +137,72 @@ impl Client {
         Ok(items)
     }
 
+    /// Downloads a Slack-hosted file (url_private). Credentials are only ever sent
+    /// to Slack hosts, and redirects are followed by hand so they can be checked.
+    pub fn fetch_file(&self, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let mut url = url.to_string();
+        for _ in 0..5 {
+            if !is_slack_file_host(&url) {
+                return Err(AppError::new(
+                    "forbidden",
+                    format!("refusing to send credentials to {url}"),
+                ));
+            }
+            self.pace();
+            let req = match &self.credentials {
+                Credentials::Standard { token } => self.http.get(&url).bearer_auth(token),
+                Credentials::Browser {
+                    xoxd_token,
+                    user_agent,
+                    ..
+                } => {
+                    let cookie: String =
+                        url::form_urlencoded::byte_serialize(xoxd_token.as_bytes()).collect();
+                    self.http
+                        .get(&url)
+                        .header("Cookie", format!("d={cookie}"))
+                        .header("User-Agent", user_agent.as_deref().unwrap_or(FALLBACK_UA))
+                }
+            };
+            let resp = req
+                .send()
+                .map_err(|e| AppError::network(format!("download: {e}")))?;
+            if resp.status().is_redirection() {
+                let next = resp
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| AppError::network("download: redirect without location"))?;
+                url = url::Url::parse(&url)
+                    .and_then(|base| base.join(next))
+                    .map_err(|_| AppError::network("download: bad redirect"))?
+                    .to_string();
+                continue;
+            }
+            if !resp.status().is_success() {
+                return Err(AppError::network(format!(
+                    "download: HTTP {}",
+                    resp.status()
+                )));
+            }
+            if resp.content_length().is_some_and(|n| n > max_bytes) {
+                return Err(AppError::input(format!(
+                    "file is larger than {max_bytes} bytes"
+                )));
+            }
+            let bytes = resp
+                .bytes()
+                .map_err(|e| AppError::network(format!("download: {e}")))?;
+            if bytes.len() as u64 > max_bytes {
+                return Err(AppError::input(format!(
+                    "file is larger than {max_bytes} bytes"
+                )));
+            }
+            return Ok(bytes.to_vec());
+        }
+        Err(AppError::network("download: too many redirects"))
+    }
+
     fn pace(&self) {
         if let Some(last) = self.last_call.get() {
             let elapsed = last.elapsed();
@@ -221,6 +291,18 @@ impl Client {
     }
 }
 
+fn is_slack_file_host(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some_and(|h| {
+                h == "slack.com"
+                    || h.ends_with(".slack.com")
+                    || h == "slack-files.com"
+                    || h.ends_with(".slack-files.com")
+            })
+    })
+}
+
 pub fn next_cursor(resp: &Value) -> Option<String> {
     resp.pointer("/response_metadata/next_cursor")
         .and_then(Value::as_str)
@@ -287,6 +369,17 @@ mod tests {
         ] {
             assert_eq!(c.call(m, vec![]).unwrap_err().code, "forbidden");
         }
+    }
+
+    #[test]
+    fn file_downloads_stay_on_slack_hosts() {
+        assert!(is_slack_file_host(
+            "https://files.slack.com/files-pri/T1-F1/x"
+        ));
+        assert!(is_slack_file_host("https://acme.slack.com/files/x"));
+        assert!(!is_slack_file_host("http://files.slack.com/x"));
+        assert!(!is_slack_file_host("https://slack.com.evil.io/x"));
+        assert!(!is_slack_file_host("https://evil.io/files.slack.com"));
     }
 
     #[test]

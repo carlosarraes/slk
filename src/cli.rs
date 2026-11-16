@@ -1,5 +1,5 @@
 use crate::client::Client;
-use crate::commands::{auth, conversations, search, users};
+use crate::commands::{auth, conversations, files, search, users};
 use crate::config::{Config, Credentials};
 use crate::error::{AppError, Result};
 use crate::output::Output;
@@ -52,6 +52,28 @@ enum Command {
         #[command(subcommand)]
         cmd: search::SearchCmd,
     },
+    /// Messages that @-mention you or your user groups
+    Mentions {
+        #[arg(long, default_value = "1d")]
+        since: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// List files and print text-based ones
+    Files {
+        #[command(subcommand)]
+        cmd: files::FilesCmd,
+    },
+    /// Read canvases as Markdown
+    Canvas {
+        #[command(subcommand)]
+        cmd: files::CanvasCmd,
+    },
+    /// Read Slack Lists
+    List {
+        #[command(subcommand)]
+        cmd: files::ListCmd,
+    },
     /// Look up users
     Users {
         #[command(subcommand)]
@@ -59,6 +81,9 @@ enum Command {
     },
     /// Print a usage guide written for LLM agents
     Llm,
+    /// Call an allowlisted read method with key=value params and print the raw response
+    #[command(hide = true)]
+    Raw { method: String, params: Vec<String> },
 }
 
 pub struct Ctx {
@@ -102,6 +127,23 @@ pub fn run() -> i32 {
         Command::Conversations { cmd } => conversations::run(&ctx, cmd),
         Command::Search { cmd } => search::run(&ctx, cmd),
         Command::Users { cmd } => users::run(&ctx, cmd),
+        Command::Mentions { since, limit } => search::mentions(&ctx, &since, limit),
+        Command::Files { cmd } => files::files(&ctx, cmd),
+        Command::Canvas { cmd } => files::canvas(&ctx, cmd),
+        Command::List { cmd } => files::list(&ctx, cmd),
+        Command::Raw { method, params } => (|| {
+            let params = params
+                .iter()
+                .map(|p| {
+                    p.split_once('=')
+                        .map(|(k, v)| (&*k.to_string().leak(), v.to_string()))
+                        .ok_or_else(|| AppError::input(format!("param '{p}' is not key=value")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let r = ctx.client()?.call(&method, params)?;
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            Ok(())
+        })(),
         Command::Llm => {
             print!("{LLM_GUIDE}");
             Ok(())

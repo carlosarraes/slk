@@ -17,21 +17,26 @@ Errors go to stderr as `{"error":{"code","message","retryable","details"}}`.
 ```
 slk auth whoami | list [--check]
 slk conversations list [--types public_channel,private_channel,mpim,im] [--limit N] [--cursor C]
-slk conversations read <channel|permalink> [--thread-ts TS] [--limit N] [--oldest TS] [--latest TS] [--cursor C]
+slk conversations read <channel|permalink> [--since 2h] [--until 1d] [--limit N] [--with-replies --reply-limit N] [--thread-ts TS] [--cursor C]
+slk conversations digest <channel> [--since 1d]     # counts, who spoke, busiest threads: triage before reading
 slk conversations get <channel> <ts>   |   slk conversations get <permalink>
-slk conversations info <channel>
-slk conversations members <channel> [--limit N]
-slk conversations unread [--messages --max-conversations N --limit N] [--types channels,dms,groups]
-slk conversations threads            # unread thread replies (browser session only)
-slk search messages "<query>" [--in '#chan'] [--from '@user'] [--limit N] [--page P] [--sort score|timestamp]
+slk conversations info <channel>  |  members <channel>
+slk conversations unread [--messages --max-conversations N --limit N]  |  threads
+slk mentions [--since 1d]                            # messages @-mentioning you or your user groups
+slk search messages "<query>" [--exact "phrase"] [--in '#chan'] [--from '@user'] [--since 3d] [--until 1d] [--limit N] [--page P]
 slk search channels <q>  |  slk search people <q>
+slk files list [--in '#chan'] [--since 7d] [--user @x] [--types snippets,spaces]  |  slk files get <id|url>
+slk canvas read <id|url>                             # Markdown
+slk list read <id|url>                               # Slack List rows keyed by column
 slk users info <user>  |  slk users list [--status active|deactivated|all]
 ```
-Global: `-w/--workspace <profile>`, `--fields a,b.c` (trim each listed item), `--json`, `--text`, `-v`.
+Times: `30m`, `2h`, `7d`, `2w` or `YYYY-MM-DD`.
+Global: `-w/--workspace <profile>`, `--fields a,b.c` (trims items; implies JSON), `--json`, `--text`, `-v`.
 
 ## Shapes
 Messages are chronological (oldest first) and already readable: `text` has `<@U…>` mentions replaced with names.
-`{ts, user, author, text, …}`. Use `ts` (and `thread_ts`) to cite or open threads.
+`{ts, user, author, text, thread_ts?, reply_count?, reactions?[{name,count}], edited?, files?, attachments?, replies?}`.
+A reaction like `white_check_mark` on a question usually means it was answered. Use `ts` (and `thread_ts`) to cite or open threads.
 Paging: when `next_cursor` is non-null, repeat the command with `--cursor <next_cursor>`.
 
 ## Tips

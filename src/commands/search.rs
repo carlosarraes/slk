@@ -1,4 +1,5 @@
 use crate::cli::{Ctx, read_limit};
+use crate::client::Client;
 use crate::commands::conversations::{channel_label, messages_text, slim_all, slim_channel};
 use crate::commands::users::slim_user;
 use crate::error::{AppError, Result};
@@ -37,6 +38,15 @@ pub enum SearchCmd {
         sort: Sort,
         #[arg(long, value_enum, default_value = "desc")]
         sort_dir: SortDir,
+        /// Match this exact phrase
+        #[arg(long)]
+        exact: Option<String>,
+        /// Only messages since (2h, 3d, 2026-11-01)
+        #[arg(long)]
+        since: Option<String>,
+        /// Only messages until (1d = up to a day ago)
+        #[arg(long)]
+        until: Option<String>,
     },
     /// Find channels by name, topic or purpose
     Channels {
@@ -64,78 +74,24 @@ pub fn run(ctx: &Ctx, cmd: SearchCmd) -> Result<()> {
             page,
             sort,
             sort_dir,
+            exact,
+            since,
+            until,
         } => {
             let limit = read_limit(limit, 100)?;
             let mut parts: Vec<String> = query.into_iter().collect();
+            parts.extend(exact.map(|e| format!("\"{}\"", e.replace('"', ""))));
             parts.extend(in_channel.map(|c| format!("in:{c}")));
             parts.extend(from.map(|u| format!("from:{u}")));
+            let window = Window::parse(since.as_deref(), until.as_deref())?;
             let q = parts.join(" ");
             if q.trim().is_empty() {
-                return Err(AppError::input("give a query, --in or --from"));
+                return Err(AppError::input("give a query, --exact, --in or --from"));
             }
-            let r = client.call(
-                "search.messages",
-                vec![
-                    ("query", q.clone()),
-                    ("count", limit.to_string()),
-                    ("page", page.to_string()),
-                    (
-                        "sort",
-                        if matches!(sort, Sort::Score) {
-                            "score"
-                        } else {
-                            "timestamp"
-                        }
-                        .into(),
-                    ),
-                    (
-                        "sort_dir",
-                        if matches!(sort_dir, SortDir::Asc) {
-                            "asc"
-                        } else {
-                            "desc"
-                        }
-                        .into(),
-                    ),
-                    ("highlight", "false".into()),
-                ],
+            let v = search_messages(
+                &client, &mut users, &q, limit, page, sort, sort_dir, &window,
             )?;
-            let raw = r["messages"]["matches"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let mut matches = slim_all(&client, &mut users, &raw);
-            for (m, src) in matches.iter_mut().zip(&raw) {
-                m["channel"] =
-                    json!({ "id": src["channel"]["id"], "name": src["channel"]["name"] });
-                m["permalink"] = src["permalink"].clone();
-            }
-            let paging = &r["messages"]["paging"];
-            let v = json!({
-                "query": q,
-                "total": r["messages"]["total"],
-                "page": paging["page"],
-                "pages": paging["pages"],
-                "matches": matches,
-            });
-            ctx.out.emit(v, |v| {
-                let mut s = format!(
-                    "{} results (page {}/{})\n\n",
-                    v["total"], v["page"], v["pages"]
-                );
-                for m in v["matches"].as_array().into_iter().flatten() {
-                    s.push_str(&format!(
-                        "#{} ",
-                        m["channel"]["name"].as_str().unwrap_or("?")
-                    ));
-                    s.push_str(&messages_text(&json!({ "messages": [m] })));
-                    s.push_str(&format!(
-                        "  {}\n\n",
-                        m["permalink"].as_str().unwrap_or_default()
-                    ));
-                }
-                s
-            });
+            ctx.out.emit(v, matches_text);
         }
         SearchCmd::Channels { query, limit } => {
             let limit = read_limit(limit, 1000)?;
@@ -221,6 +177,187 @@ pub fn run(ctx: &Ctx, cmd: SearchCmd) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// A `--since`/`--until` window. Slack's `after:`/`before:` are whole days and
+/// exclusive, so the query is widened by a day and trimmed by timestamp locally.
+#[derive(Default)]
+pub struct Window {
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+}
+
+impl Window {
+    pub fn parse(since: Option<&str>, until: Option<&str>) -> Result<Self> {
+        Ok(Self {
+            since_ms: since.map(crate::time::parse_since).transpose()?,
+            until_ms: until.map(crate::time::parse_since).transpose()?,
+        })
+    }
+
+    fn operators(&self) -> Vec<String> {
+        const DAY: i64 = 86_400_000;
+        let mut ops = Vec::new();
+        if let Some(s) = self.since_ms {
+            ops.push(format!("after:{}", crate::time::ms_to_date(s - DAY)));
+        }
+        if let Some(u) = self.until_ms {
+            ops.push(format!("before:{}", crate::time::ms_to_date(u + DAY)));
+        }
+        ops
+    }
+
+    fn contains(&self, ts: &str) -> bool {
+        let ms = ts
+            .split('.')
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .map_or(0, |s| s * 1000);
+        self.since_ms.is_none_or(|s| ms >= s) && self.until_ms.is_none_or(|u| ms <= u)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_messages(
+    client: &Client,
+    users: &mut Users,
+    query: &str,
+    limit: usize,
+    page: usize,
+    sort: Sort,
+    sort_dir: SortDir,
+    window: &Window,
+) -> Result<Value> {
+    let mut q = query.to_string();
+    for op in window.operators() {
+        q.push(' ');
+        q.push_str(&op);
+    }
+    let r = client.call(
+        "search.messages",
+        vec![
+            ("query", q.trim().to_string()),
+            ("count", limit.to_string()),
+            ("page", page.to_string()),
+            (
+                "sort",
+                if matches!(sort, Sort::Score) {
+                    "score"
+                } else {
+                    "timestamp"
+                }
+                .into(),
+            ),
+            (
+                "sort_dir",
+                if matches!(sort_dir, SortDir::Asc) {
+                    "asc"
+                } else {
+                    "desc"
+                }
+                .into(),
+            ),
+            ("highlight", "false".into()),
+        ],
+    )?;
+    let raw: Vec<Value> = r["messages"]["matches"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| window.contains(m["ts"].as_str().unwrap_or_default()))
+        .cloned()
+        .collect();
+    let mut matches = slim_all(client, users, &raw);
+    for (m, src) in matches.iter_mut().zip(&raw) {
+        m["channel"] = json!({ "id": src["channel"]["id"], "name": src["channel"]["name"] });
+        m["permalink"] = src["permalink"].clone();
+    }
+    let paging = &r["messages"]["paging"];
+    Ok(json!({
+        "query": q.trim(),
+        "total": r["messages"]["total"],
+        "page": paging["page"],
+        "pages": paging["pages"],
+        "matches": matches,
+    }))
+}
+
+pub fn matches_text(v: &Value) -> String {
+    let mut s = format!(
+        "{} results (page {}/{})\n\n",
+        v["total"], v["page"], v["pages"]
+    );
+    for m in v["matches"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "#{} ",
+            m["channel"]["name"].as_str().unwrap_or("?")
+        ));
+        s.push_str(&messages_text(&json!({ "messages": [m] })));
+        s.push_str(&format!(
+            "  {}\n\n",
+            m["permalink"].as_str().unwrap_or_default()
+        ));
+    }
+    s
+}
+
+/// Messages that mention me or one of my user groups, newest first.
+pub fn mentions(ctx: &Ctx, since: &str, limit: usize) -> Result<()> {
+    let limit = read_limit(limit, 100)?;
+    let client = ctx.client()?;
+    let mut users = Users::default();
+    let me = client.call("auth.test", vec![])?["user_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let mut tokens = vec![format!("<@{me}>")];
+    // User groups need the usergroups:read scope; without it, mention search still works.
+    if let Ok(r) = client.call("usergroups.list", vec![("include_users", "true".into())]) {
+        for g in r["usergroups"].as_array().into_iter().flatten() {
+            let mine = g["users"]
+                .as_array()
+                .is_some_and(|u| u.iter().any(|x| x == me.as_str()));
+            if mine && let Some(id) = g["id"].as_str() {
+                tokens.push(format!("<!subteam^{id}>"));
+            }
+        }
+    }
+    let window = Window::parse(Some(since), None)?;
+    let mut all: Vec<Value> = Vec::new();
+    for t in &tokens {
+        let r = search_messages(
+            &client,
+            &mut users,
+            t,
+            limit,
+            1,
+            Sort::Timestamp,
+            SortDir::Desc,
+            &window,
+        )?;
+        for m in r["matches"].as_array().into_iter().flatten() {
+            if !all.iter().any(|x| x["permalink"] == m["permalink"]) {
+                all.push(m.clone());
+            }
+        }
+    }
+    all.sort_by(|a, b| {
+        let ts = |m: &Value| {
+            m["ts"]
+                .as_str()
+                .unwrap_or_default()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        };
+        ts(b)
+            .partial_cmp(&ts(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all.truncate(limit);
+    let v =
+        json!({ "mentions_of": tokens, "total": all.len(), "page": 1, "pages": 1, "matches": all });
+    ctx.out.emit(v, matches_text);
     Ok(())
 }
 

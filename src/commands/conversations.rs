@@ -38,12 +38,36 @@ pub enum ConvCmd {
         /// Only messages before this ts
         #[arg(long)]
         latest: Option<String>,
+        /// Only messages since (2h, 1d, 2026-11-01); overrides --oldest
+        #[arg(long)]
+        since: Option<String>,
+        /// Only messages until (1d = up to a day ago); overrides --latest
+        #[arg(long)]
+        until: Option<String>,
         /// Drop thread replies broadcast into the channel
         #[arg(long)]
         exclude_replies: bool,
+        /// Inline each thread's replies under its parent
+        #[arg(long)]
+        with_replies: bool,
+        /// With --with-replies: max replies per thread
+        #[arg(long, default_value_t = 20)]
+        reply_limit: usize,
         /// Resume from a previous next_cursor
         #[arg(long)]
         cursor: Option<String>,
+    },
+    /// Cheap triage: message count, who spoke, busiest threads
+    Digest {
+        channel: String,
+        #[arg(long, default_value = "1d")]
+        since: String,
+        /// Max messages scanned
+        #[arg(long, default_value_t = 1000)]
+        scan: usize,
+        /// Threads listed
+        #[arg(long, default_value_t = 5)]
+        top: usize,
     },
     /// Fetch one message by channel + ts, or by permalink
     Get {
@@ -121,10 +145,17 @@ pub fn run(ctx: &Ctx, cmd: ConvCmd) -> Result<()> {
             limit,
             oldest,
             latest,
+            since,
+            until,
             exclude_replies,
+            with_replies,
+            reply_limit,
             cursor,
         } => {
             let limit = read_limit(limit, 1000)?;
+            let reply_limit = read_limit(reply_limit, 1000)?;
+            let oldest = since.as_deref().map(slack_ts_since).transpose()?.or(oldest);
+            let latest = until.as_deref().map(slack_ts_since).transpose()?.or(latest);
             let target = resolve::channel(&client, &mut users, &channel)?;
             let thread = match thread_ts {
                 Some(t) => Some(permalink::normalize_ts(&t)?),
@@ -148,7 +179,32 @@ pub fn run(ctx: &Ctx, cmd: ConvCmd) -> Result<()> {
                 // history is newest-first; agents read top-down, so flip to chronological.
                 raw.reverse();
             }
-            let messages = slim_all(&client, &mut users, &raw);
+            let mut messages = slim_all(&client, &mut users, &raw);
+            if with_replies && thread.is_none() {
+                for (m, src) in messages.iter_mut().zip(&raw) {
+                    if src["reply_count"].as_u64().unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let r = client.call(
+                        "conversations.replies",
+                        vec![
+                            ("channel", target.id.clone()),
+                            ("ts", src["ts"].as_str().unwrap_or_default().to_string()),
+                            ("limit", (reply_limit + 1).to_string()),
+                        ],
+                    )?;
+                    // The first entry is the parent itself.
+                    let replies: Vec<Value> = r["messages"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|x| x["ts"] != src["ts"])
+                        .take(reply_limit)
+                        .cloned()
+                        .collect();
+                    m["replies"] = json!(slim_all(&client, &mut users, &replies));
+                }
+            }
             let v = json!({
                 "channel": target.id,
                 "thread_ts": thread,
@@ -157,6 +213,29 @@ pub fn run(ctx: &Ctx, cmd: ConvCmd) -> Result<()> {
                 "next_cursor": next_cursor(&r),
             });
             ctx.out.emit(v, messages_text);
+        }
+        ConvCmd::Digest {
+            channel,
+            since,
+            scan,
+            top,
+        } => {
+            let target = resolve::channel(&client, &mut users, &channel)?;
+            let oldest = slack_ts_since(&since)?;
+            let raw = client.paginate(
+                "conversations.history",
+                vec![
+                    ("channel", target.id.clone()),
+                    ("oldest", oldest.clone()),
+                    ("limit", "200".into()),
+                ],
+                "messages",
+                read_limit(scan, 10_000)?,
+            )?;
+            let ids: Vec<&str> = raw.iter().filter_map(|m| m["user"].as_str()).collect();
+            users.ensure(&client, ids);
+            let v = digest(&target.id, &oldest, &raw, top, &users);
+            ctx.out.emit(v, digest_text);
         }
         ConvCmd::Get { channel, ts } => {
             let target = resolve::channel(&client, &mut users, &channel)?;
@@ -231,6 +310,97 @@ pub fn run(ctx: &Ctx, cmd: ConvCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `2h`/`1d`/date to a Slack ts (`secs.micros`).
+pub fn slack_ts_since(input: &str) -> Result<String> {
+    let ms = crate::time::parse_since(input)?;
+    Ok(format!("{}.{:06}", ms / 1000, (ms % 1000) * 1000))
+}
+
+fn digest(channel: &str, oldest: &str, raw: &[Value], top: usize, users: &Users) -> Value {
+    let mut speakers: Vec<(String, u64)> = Vec::new();
+    for m in raw {
+        let who = m["user"]
+            .as_str()
+            .and_then(|u| users.get(u).map(|x| x.label().to_string()))
+            .or_else(|| m["username"].as_str().map(str::to_string))
+            .or_else(|| m["bot_profile"]["name"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".into());
+        match speakers.iter_mut().find(|(n, _)| *n == who) {
+            Some((_, c)) => *c += 1,
+            None => speakers.push((who, 1)),
+        }
+    }
+    speakers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut threads: Vec<&Value> = raw
+        .iter()
+        .filter(|m| m["reply_count"].as_u64().unwrap_or(0) > 0)
+        .collect();
+    threads.sort_by_key(|m| std::cmp::Reverse(m["reply_count"].as_u64().unwrap_or(0)));
+    let first_line = |m: &Value| -> String {
+        let t = render::plain_text(m["text"].as_str().unwrap_or_default(), users);
+        t.lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(140)
+            .collect()
+    };
+    json!({
+        "channel": channel,
+        "since": oldest,
+        "messages": raw.len(),
+        "threads": threads.len(),
+        "speakers": speakers.iter().map(|(n, c)| json!({ "name": n, "messages": c })).collect::<Vec<_>>(),
+        "top_threads": threads.iter().take(top).map(|m| json!({
+            "ts": m["ts"],
+            "replies": m["reply_count"],
+            "author": m["user"].as_str().and_then(|u| users.get(u).map(|x| x.label().to_string())),
+            "text": first_line(m),
+        })).collect::<Vec<_>>(),
+        "first_ts": raw.last().map(|m| m["ts"].clone()),
+        "last_ts": raw.first().map(|m| m["ts"].clone()),
+    })
+}
+
+fn digest_text(v: &Value) -> String {
+    let mut s = format!(
+        "{} messages, {} threads since {}
+
+Who spoke:
+",
+        v["messages"],
+        v["threads"],
+        render::fmt_ts(v["since"].as_str().unwrap_or_default())
+    );
+    for sp in v["speakers"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "  {:>4}  {}
+",
+            sp["messages"],
+            sp["name"].as_str().unwrap_or_default()
+        ));
+    }
+    let threads = v["top_threads"].as_array().cloned().unwrap_or_default();
+    if !threads.is_empty() {
+        s.push_str(
+            "
+Busiest threads:
+",
+        );
+        for t in &threads {
+            s.push_str(&format!(
+                "  {:>3} replies  {}: {}  (ts {})
+",
+                t["replies"],
+                t["author"].as_str().unwrap_or("?"),
+                t["text"].as_str().unwrap_or_default(),
+                t["ts"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+    s
 }
 
 /// Reads a thread; when `ts` is a reply, re-reads from its parent.
@@ -343,7 +513,15 @@ pub fn messages_text(v: &Value) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .map(render::message_text)
+        .map(|m| {
+            let mut out = render::message_text(m);
+            for r in m["replies"].as_array().into_iter().flatten() {
+                for line in render::message_text(r).lines() {
+                    out.push_str(&format!("    │ {line}\n"));
+                }
+            }
+            out
+        })
         .collect();
     if s.is_empty() {
         s.push_str("No messages.\n");

@@ -16,6 +16,7 @@ url = "2"
 regex = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tempfile = "3"
+htmd = "0.5.6"
 
 [profile.release]
 strip = true
