@@ -123,6 +123,7 @@ pub fn run(ctx: &Ctx, cmd: AuthCmd) -> Result<()> {
         AuthCmd::List { check } => {
             let cfg = Config::load()?;
             let mut rows = Vec::new();
+            let mut failed: Vec<(&str, AppError)> = Vec::new();
             for (key, ws) in &cfg.workspaces {
                 let mut row = json!({
                     "profile": key,
@@ -133,11 +134,16 @@ pub fn run(ctx: &Ctx, cmd: AuthCmd) -> Result<()> {
                     "default": cfg.default_workspace.as_deref() == Some(key.as_str()),
                 });
                 if check {
-                    let ok = Client::new(ws.credentials.clone(), ctx.verbose)
-                        .and_then(|c| c.call("auth.test", vec![]));
-                    row["valid"] = json!(ok.is_ok());
-                    if let Err(e) = ok {
-                        row["error"] = json!(e.message);
+                    let outcome = Client::new(ws.credentials.clone(), ctx.verbose)
+                        .and_then(|c| c.call_once("auth.test", vec![]));
+                    row["valid"] = json!(outcome.is_ok());
+                    match outcome {
+                        Ok(_) => row["status"] = json!("ok"),
+                        Err(e) => {
+                            row["status"] = json!(check_status(&e));
+                            row["error"] = json!(e.message);
+                            failed.push((key, e));
+                        }
                     }
                 }
                 rows.push(row);
@@ -158,14 +164,34 @@ pub fn run(ctx: &Ctx, cmd: AuthCmd) -> Result<()> {
                             r["user"].as_str().unwrap_or_default(),
                             match r.get("valid") {
                                 Some(Value::Bool(true)) => "  ✓".to_string(),
-                                Some(_) =>
-                                    format!("  ✗ {}", r["error"].as_str().unwrap_or_default()),
+                                Some(_) => format!(
+                                    "  ✗ {}: {}",
+                                    r["status"].as_str().unwrap_or_default(),
+                                    r["error"].as_str().unwrap_or_default()
+                                ),
                                 None => String::new(),
                             }
                         )
                     })
                     .collect()
             });
+            // The full report is already out; the exit code is that of the first
+            // failing profile so scripts can gate on it.
+            if let Some((_, first)) = failed.first() {
+                let profiles: Vec<&str> = failed.iter().map(|(k, _)| *k).collect();
+                let mut err = AppError::new(
+                    &first.code,
+                    format!(
+                        "{} of {} workspaces failed the check: {}",
+                        failed.len(),
+                        rows.len(),
+                        profiles.join(", ")
+                    ),
+                )
+                .with_details(json!({ "failed": profiles }));
+                err.retryable = first.retryable;
+                return Err(err);
+            }
             Ok(())
         }
         AuthCmd::Whoami => {
@@ -243,6 +269,21 @@ fn login(ctx: &Ctx, credentials: Credentials, profile: Option<String>) -> Result
     Ok(())
 }
 
+/// Coarse, stable label for a failed `auth list --check` probe.
+fn check_status(err: &AppError) -> &'static str {
+    match err.details["slack_error"].as_str() {
+        Some("token_expired") => "expired",
+        Some("token_revoked" | "account_inactive") => "revoked",
+        Some("invalid_auth" | "not_authed") => "invalid",
+        _ => match err.code.as_str() {
+            // Slack answers a dead browser session with a redirect to sign-in.
+            "authentication" => "expired",
+            "network" => "network",
+            _ => "error",
+        },
+    }
+}
+
 fn slug(name: &str, fallback: &str) -> String {
     let s: String = name
         .to_lowercase()
@@ -260,4 +301,22 @@ fn slug(name: &str, fallback: &str) -> String {
 fn redact(secret: &str) -> String {
     let head: String = secret.chars().take(9).collect();
     format!("{head}…({} chars)", secret.chars().count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_status_labels() {
+        let slack = |e| AppError::slack("auth.test", e, &json!({}));
+        assert_eq!(check_status(&slack("token_expired")), "expired");
+        assert_eq!(check_status(&slack("token_revoked")), "revoked");
+        assert_eq!(check_status(&slack("account_inactive")), "revoked");
+        assert_eq!(check_status(&slack("invalid_auth")), "invalid");
+        assert_eq!(check_status(&slack("ratelimited")), "error");
+        assert_eq!(check_status(&AppError::network("x")), "network");
+        assert_eq!(check_status(&AppError::auth("redirected")), "expired");
+        assert_eq!(check_status(&AppError::config("bad url")), "error");
+    }
 }

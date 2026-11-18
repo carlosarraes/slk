@@ -43,9 +43,10 @@ pub struct Client {
 
 impl Client {
     pub fn new(credentials: Credentials, verbose: bool) -> Result<Self> {
-        let base = match &credentials {
-            Credentials::Standard { .. } => "https://slack.com/api".to_string(),
-            Credentials::Browser { workspace_url, .. } => {
+        let base = match (api_base_override()?, &credentials) {
+            (Some(base), _) => base,
+            (None, Credentials::Standard { .. }) => "https://slack.com/api".to_string(),
+            (None, Credentials::Browser { workspace_url, .. }) => {
                 format!(
                     "{}/api",
                     crate::config::normalize_workspace_url(workspace_url)?
@@ -74,13 +75,15 @@ impl Client {
         self.credentials.is_browser()
     }
 
+    /// A single attempt: no retries, no backoff. For probes like `auth list --check`
+    /// that must report what happened rather than wait it out.
+    pub fn call_once(&self, method: &str, params: Params) -> Result<Value> {
+        ensure_read_only(method)?;
+        self.send(method, &params).map_err(|(err, _)| err)
+    }
+
     pub fn call(&self, method: &str, params: Params) -> Result<Value> {
-        if !READ_METHODS.contains(&method) {
-            return Err(AppError::new(
-                "forbidden",
-                format!("{method} is not a read-only method; slk refuses to call it"),
-            ));
-        }
+        ensure_read_only(method)?;
         let mut attempt = 0;
         loop {
             self.pace();
@@ -291,6 +294,43 @@ impl Client {
     }
 }
 
+fn ensure_read_only(method: &str) -> Result<()> {
+    if READ_METHODS.contains(&method) {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "forbidden",
+        format!("{method} is not a read-only method; slk refuses to call it"),
+    ))
+}
+
+/// `SLK_API_BASE_URL` points the API at a local fake server for tests. Only
+/// loopback http is accepted so a stray env var can never redirect tokens to a
+/// remote host.
+fn api_base_override() -> Result<Option<String>> {
+    match std::env::var("SLK_API_BASE_URL") {
+        Ok(raw) if !raw.is_empty() => loopback_base(&raw).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn loopback_base(raw: &str) -> Result<String> {
+    let url = url::Url::parse(raw).ok().filter(|u| {
+        let loopback = match u.host() {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Domain(d)) => d == "localhost",
+            _ => false,
+        };
+        u.scheme() == "http" && loopback
+    });
+    match url {
+        Some(u) => Ok(u.as_str().trim_end_matches('/').to_string()),
+        None => Err(AppError::config(
+            "SLK_API_BASE_URL must be an http://127.0.0.1 or http://localhost URL",
+        )),
+    }
+}
+
 fn is_slack_file_host(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|u| {
         u.scheme() == "https"
@@ -313,6 +353,23 @@ pub fn next_cursor(resp: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_base_override_accepts_only_loopback_http() {
+        assert_eq!(
+            loopback_base("http://127.0.0.1:8080/api/").unwrap(),
+            "http://127.0.0.1:8080/api"
+        );
+        assert!(loopback_base("http://localhost:1").is_ok());
+        for bad in [
+            "https://127.0.0.1:1",
+            "http://slack.com/api",
+            "http://127.0.0.1.evil.com",
+            "nonsense",
+        ] {
+            assert_eq!(loopback_base(bad).unwrap_err().code, "configuration");
+        }
+    }
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
