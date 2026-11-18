@@ -172,17 +172,16 @@ fn mixed_accounts() -> tempfile::TempDir {
 }
 
 #[test]
-fn check_reports_every_account_and_exits_with_first_failure_code() {
+fn check_reports_every_account_and_exits_zero() {
     let (addr, seen) = fake_slack();
     let cfg = mixed_accounts();
     let o = slk(&cfg, &base(addr), &["auth", "list", "--check"]);
     assert_no_tokens(&o);
 
-    // First failing profile in key order is "expired" (authentication -> 3).
-    assert_eq!(
-        o.status.code(),
-        Some(3),
-        "stderr: {}",
+    assert_eq!(o.status.code(), Some(0));
+    assert!(
+        o.stderr.is_empty(),
+        "{}",
         String::from_utf8_lossy(&o.stderr)
     );
     let v = out_json(&o);
@@ -209,13 +208,6 @@ fn check_reports_every_account_and_exits_with_first_failure_code() {
     assert_eq!(row(&v, "acme")["default"], true);
     assert_eq!(row(&v, "acme")["team_name"], "Acme");
 
-    let err: Value = serde_json::from_slice(&o.stderr).unwrap();
-    assert_eq!(err["error"]["code"], "authentication");
-    assert_eq!(
-        err["error"]["details"]["failed"],
-        json!(["expired", "flaky", "invalid", "revoked"])
-    );
-
     // One auth.test per account, never retried (the 500 included).
     let mut calls = seen.lock().unwrap().clone();
     calls.sort();
@@ -241,11 +233,8 @@ fn check_text_output_marks_each_account() {
     );
     assert!(line("Expired").contains("  ✗ expired:"), "{text}");
     assert!(line("Flaky").contains("  ✗ network:"), "{text}");
-    let stderr = String::from_utf8_lossy(&o.stderr);
-    assert!(
-        stderr.starts_with("error: 4 of 6 workspaces failed the check"),
-        "{stderr}"
-    );
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stderr.is_empty());
 }
 
 #[test]
@@ -277,13 +266,12 @@ fn check_reports_unreachable_server_as_network_error() {
     );
     let o = slk(&cfg, &base(dead), &["auth", "list", "--check"]);
     assert_no_tokens(&o);
-    assert_eq!(o.status.code(), Some(7));
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stderr.is_empty());
     let v = out_json(&o);
     assert_eq!(row(&v, "acme")["status"], "network");
     assert_eq!(row(&v, "acme")["valid"], false);
-    let err: Value = serde_json::from_slice(&o.stderr).unwrap();
-    assert_eq!(err["error"]["code"], "network");
-    assert_eq!(err["error"]["retryable"], true);
+    assert!(row(&v, "acme")["error"].as_str().is_some());
 }
 
 #[test]
@@ -318,7 +306,9 @@ fn api_base_override_refuses_non_loopback_hosts() {
         &["auth", "list", "--check"],
     );
     assert_no_tokens(&o);
-    assert_eq!(o.status.code(), Some(9));
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stderr.is_empty());
     let v = out_json(&o);
     assert_eq!(row(&v, "acme")["status"], "error");
+    assert_eq!(row(&v, "acme")["valid"], false);
 }

@@ -123,7 +123,6 @@ pub fn run(ctx: &Ctx, cmd: AuthCmd) -> Result<()> {
         AuthCmd::List { check } => {
             let cfg = Config::load()?;
             let mut rows = Vec::new();
-            let mut failed: Vec<(&str, AppError)> = Vec::new();
             for (key, ws) in &cfg.workspaces {
                 let mut row = json!({
                     "profile": key,
@@ -142,7 +141,6 @@ pub fn run(ctx: &Ctx, cmd: AuthCmd) -> Result<()> {
                         Err(e) => {
                             row["status"] = json!(check_status(&e));
                             row["error"] = json!(e.message);
-                            failed.push((key, e));
                         }
                     }
                 }
@@ -175,23 +173,7 @@ pub fn run(ctx: &Ctx, cmd: AuthCmd) -> Result<()> {
                     })
                     .collect()
             });
-            // The full report is already out; the exit code is that of the first
-            // failing profile so scripts can gate on it.
-            if let Some((_, first)) = failed.first() {
-                let profiles: Vec<&str> = failed.iter().map(|(k, _)| *k).collect();
-                let mut err = AppError::new(
-                    &first.code,
-                    format!(
-                        "{} of {} workspaces failed the check: {}",
-                        failed.len(),
-                        rows.len(),
-                        profiles.join(", ")
-                    ),
-                )
-                .with_details(json!({ "failed": profiles }));
-                err.retryable = first.retryable;
-                return Err(err);
-            }
+            // Like `ntn auth list --check`: failures live in the rows, the exit stays 0.
             Ok(())
         }
         AuthCmd::Whoami => {
