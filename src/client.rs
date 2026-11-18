@@ -304,9 +304,10 @@ fn ensure_read_only(method: &str) -> Result<()> {
     ))
 }
 
-/// `SLK_API_BASE_URL` points the API at a local fake server for tests. Only
-/// loopback http is accepted so a stray env var can never redirect tokens to a
-/// remote host.
+/// `SLK_API_BASE_URL` points the API at a local fake server for tests. It only
+/// exists in debug builds, so release binaries cannot be redirected, and even
+/// there only loopback http is accepted.
+#[cfg(debug_assertions)]
 fn api_base_override() -> Result<Option<String>> {
     match std::env::var("SLK_API_BASE_URL") {
         Ok(raw) if !raw.is_empty() => loopback_base(&raw).map(Some),
@@ -314,6 +315,12 @@ fn api_base_override() -> Result<Option<String>> {
     }
 }
 
+#[cfg(not(debug_assertions))]
+fn api_base_override() -> Result<Option<String>> {
+    Ok(None)
+}
+
+#[cfg(debug_assertions)]
 fn loopback_base(raw: &str) -> Result<String> {
     let url = url::Url::parse(raw).ok().filter(|u| {
         let loopback = match u.host() {
@@ -354,6 +361,7 @@ pub fn next_cursor(resp: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(debug_assertions)]
     #[test]
     fn api_base_override_accepts_only_loopback_http() {
         assert_eq!(

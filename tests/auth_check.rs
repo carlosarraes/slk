@@ -1,6 +1,9 @@
 //! `slk auth list --check` driven through the real binary against a fake Slack
 //! API on 127.0.0.1 (SLK_API_BASE_URL). No real tokens, no real network.
 
+// The base-URL override is compiled out of release builds.
+#![cfg(debug_assertions)]
+
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
