@@ -19,7 +19,7 @@ Errors go to stderr as `{"error":{"code","message","retryable","details"}}`.
 
 ## Commands
 ```
-slk auth whoami | list [--check]
+slk auth whoami | list [--check]                    # --check: verify each saved token (see Tips)
 slk conversations list [--types public_channel,private_channel,mpim,im] [--limit N] [--cursor C]
 slk conversations read <channel|permalink> [--since 2h] [--until 1d] [--limit N] [--with-replies --reply-limit N] [--thread-ts TS] [--cursor C]
 slk conversations digest <channel> [--since 1d]     # counts, who spoke, busiest threads: triage before reading
@@ -48,3 +48,4 @@ Paging: when `next_cursor` is non-null, repeat the command with `--cursor <next_
 - Search needs a user token (xoxp) or browser session; bot tokens get exit 3.
 - Search operators: `in:#chan from:@user before:2026-01-01 after:2025-12-01 has:link is:thread`.
 - Keep output small: `--limit 20 --fields ts,author,text`.
+- `slk auth list --check` calls `auth.test` once per stored workspace and adds `valid` (bool) and `status` (`ok|expired|revoked|invalid|network|error`, plus `error` text when not ok) to each row. It prints every row, then exits with the first failing profile's code (3 auth, 7 network, ...); without `--check` it stays offline.

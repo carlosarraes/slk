@@ -22,6 +22,8 @@ SLK_TOKEN=xoxp-... slk conversations list    # ephemeral, nothing stored
 
 Credentials are stored in `~/.config/slk/workspaces.json` (mode 0600). `slk auth list` and `slk auth set-default` manage several workspaces.
 
+`slk auth list --check` makes one `auth.test` call per stored workspace and reports each as `ok`, `expired`, `revoked`, `invalid` or `network` (JSON adds `valid`, `status` and `error` to every row; text shows `✓` or `✗ <status>: <reason>`). All rows are printed even when some fail, then the exit code is that of the first failing workspace (3 for dead credentials, 7 for network). Tokens are never printed. Plain `slk auth list` stays offline.
+
 ## Use
 
 ```sh
